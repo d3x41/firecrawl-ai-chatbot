@@ -104,13 +104,12 @@ export async function getChatById({ id }: { id: string }) {
   }
 }
 
-export async function saveMessages({ messages }: { messages: Array<Message> }) {
-  try {
-    return await db.insert(message).values(messages);
-  } catch (error) {
-    console.error('Failed to save messages in database', error);
-    throw error;
+export async function saveMessages(messages: Message[]) {
+  if (!messages || messages.length === 0) {
+    return [];
   }
+
+  return await db.insert(message).values(messages).returning();
 }
 
 export async function getMessagesByChatId({ id }: { id: string }) {

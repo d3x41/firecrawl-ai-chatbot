@@ -32,6 +32,10 @@ import {
 } from '@/lib/utils';
 
 import { generateTitleFromUserMessage } from '../../actions';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
 
 export const maxDuration = 60;
 
@@ -39,17 +43,24 @@ type AllowedTools =
   | 'createDocument'
   | 'updateDocument'
   | 'requestSuggestions'
-  | 'getWeather';
+  | 'getWeather'
+  | 'firecrawlSearch'
+  | 'firecrawlExtract';
 
-const blocksTools: AllowedTools[] = [
-  'createDocument',
-  'updateDocument',
-  'requestSuggestions',
-];
-
-const weatherTools: AllowedTools[] = ['getWeather'];
-
-const allTools: AllowedTools[] = [...blocksTools, ...weatherTools];
+  const blocksTools: AllowedTools[] = [
+    'createDocument',
+    'updateDocument',
+    'requestSuggestions',
+  ];
+  
+  const weatherTools: AllowedTools[] = ['getWeather'];
+  
+  // Add Firecrawl tools here
+  const firecrawlTools: AllowedTools[] = ['firecrawlSearch', 'firecrawlExtract'];
+  
+  // Combine them all
+  const allTools: AllowedTools[] = [...firecrawlTools];
+  
 
 export async function POST(request: Request) {
   const {
@@ -87,11 +98,9 @@ export async function POST(request: Request) {
 
   const userMessageId = generateUUID();
 
-  await saveMessages({
-    messages: [
-      { ...userMessage, id: userMessageId, createdAt: new Date(), chatId: id },
-    ],
-  });
+  await saveMessages([
+    { role: userMessage.role, content: userMessage.content, id: userMessageId, createdAt: new Date(), chatId: id },
+  ]);
 
   return createDataStreamResponse({
     execute: (dataStream) => {
@@ -120,6 +129,89 @@ export async function POST(request: Request) {
 
               const weatherData = await response.json();
               return weatherData;
+            },
+          },
+          firecrawlSearch: {
+            description: 'Search the web with Firecrawl and optionally retrieve page content with scrapeOptions. Only use this tool if you are going to run firecrawlExtract after it. You must run firecrawlExtract after firecrawlSearch!',
+            parameters: z.object({
+              query: z.string(),
+              limit: z.number().optional().default(5),
+              tbs: z.string().optional().default(''), // Time-based search param for Google (e.g. qdr:d => past day)
+              lang: z.string().optional().default('en'),
+              country: z.string().optional().default('us'),
+              location: z.string().optional().default(''),
+              timeout: z.number().optional().default(60000),
+              // If you want to retrieve the full page content, pass: scrapeOptions: { formats: ["markdown"] }
+              scrapeOptions: z
+                .object({
+                  formats: z.array(z.string()).optional(),
+                })
+                .optional(),
+            }),
+            execute: async (args) => {
+              console.log('firecrawlSearch');
+              console.log('args', args);
+              const response = await fetch('https://api.firecrawl.dev/v1/search', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  query: args.query,
+                  limit: args.limit,
+                  tbs: args.tbs,
+                  lang: args.lang,
+                  country: args.country,
+                  location: args.location,
+                  timeout: args.timeout,
+                  scrapeOptions: args.scrapeOptions || {},
+                }),
+              });
+        
+              if (!response.ok) {
+                throw new Error(
+                  `Firecrawl Search failed with status ${response.status} ${response.statusText}`,
+                );
+              }
+        
+              const json = await response.json();
+              return json; // Return to the LLM or the calling chain
+            },
+          },
+        
+          // -------------- NEW: Firecrawl Extract --------------
+          firecrawlExtract: {
+            description:
+              'Extract structured data from one to two URLs. Use a prompt to describe what data to extract.',
+            parameters: z.object({
+              urls: z.array(z.string()),
+              prompt: z.string().describe('Description of the data to extract'),
+            }),
+            execute: async (args) => {
+              console.log('firecrawlExtract');
+              console.log('args', args);
+              // For example, you can allow "https://example.com/*" to crawl entire site
+              const response = await fetch('https://api.firecrawl.dev/v1/extract', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  urls: args.urls,
+                  prompt: args.prompt,
+                }),
+              });
+        
+              if (!response.ok) {
+                throw new Error(
+                  `Firecrawl Extract failed with status ${response.status} ${response.statusText}`,
+                );
+              }
+        
+              const json = await response.json();
+              return json; // Return to the LLM or the calling chain
             },
           },
           createDocument: {
@@ -415,29 +507,31 @@ export async function POST(request: Request) {
               const responseMessagesWithoutIncompleteToolCalls =
                 sanitizeResponseMessages(response.messages);
 
-              await saveMessages({
-                messages: responseMessagesWithoutIncompleteToolCalls.map(
-                  (message) => {
-                    const messageId = generateUUID();
+              const messages = responseMessagesWithoutIncompleteToolCalls.map(
+                (message) => {
+                  const messageId = generateUUID();
 
-                    if (message.role === 'assistant') {
-                      dataStream.writeMessageAnnotation({
-                        messageIdFromServer: messageId,
-                      });
-                    }
+                  if (message.role === 'assistant') {
+                    dataStream.writeMessageAnnotation({
+                      messageIdFromServer: messageId,
+                    });
+                  }
 
-                    return {
-                      id: messageId,
-                      chatId: id,
-                      role: message.role,
-                      content: message.content,
-                      createdAt: new Date(),
-                    };
-                  },
-                ),
-              });
+                  return {
+                    id: messageId,
+                    chatId: id,
+                    role: message.role,
+                    content: message.content,
+                    createdAt: new Date(),
+                  };
+                },
+              );
+
+              if (messages && messages.length > 0) {
+                await saveMessages(messages);
+              }
             } catch (error) {
-              console.error('Failed to save chat');
+              console.error('Failed to save messages in database', error);
             }
           }
         },
